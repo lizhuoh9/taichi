@@ -17,7 +17,7 @@ LAUNCH_FASTPATH: whether the launch fast paths of taichi.lang.kernel_impl are on
 import os
 
 NAME = "lizhuoh9/taichi"
-VERSION = "1.7.4+2"
+VERSION = "1.7.4+3"
 BASE = "v1.7.4"
 LAUNCH_FASTPATH_VARIABLE = "TI_LAUNCH_FASTPATH"
 

@@ -1,5 +1,7 @@
 # Changed in the fork lizhuoh9/taichi on 2026-11-06 (see FORK.md): launch fast paths in extract_arg, _process_args and
 # Kernel.launch_kernel, on unless TI_LAUNCH_FASTPATH=0; they return and raise what Taichi 1.7.4 returns and raises.
+# Changed on 2026-11-07: fast path d, descriptors for the kernels of a data_oriented class instead of its hook; it too
+# returns and raises what 1.7.4 does, except the differences listed under change 7 of FORK.md.
 import ast
 import functools
 import inspect
@@ -57,8 +59,10 @@ from taichi._fork import LAUNCH_FASTPATH as _LAUNCH_FASTPATH
 #   a. TaichiCallableTemplateMapper.extract_arg keys a template argument by a decision made once per type;
 #   b. _process_args returns a call's positional arguments when they fill every parameter;
 #   c. Kernel.launch_kernel launches a kernel whose non-template parameters are all primitive scalars with a plan made
-#      at its first launch, and keeps each compiled kernel's CompiledKernelData for its program.
-# _LAUNCH_FASTPATH is taichi._fork.LAUNCH_FASTPATH: TI_LAUNCH_FASTPATH=0 at import turns all three off.
+#      at its first launch, and keeps each compiled kernel's CompiledKernelData for its program;
+#   d. data_oriented gives a class a descriptor for each of its kernels instead of a __getattribute__ hook, so that
+#      reading any other attribute of an instance is Python's own lookup (see data_oriented).
+# _LAUNCH_FASTPATH is taichi._fork.LAUNCH_FASTPATH: TI_LAUNCH_FASTPATH=0 at import turns all four off.
 _KEY_FROM_RELEASED_BRANCHES, _KEY_IS_ARGUMENT, _KEY_IS_WEAK_REFERENCE = 0, 1, 2
 _TEMPLATE_KEY_KINDS = {}  # a. type -> one of the three kinds above
 _PRIMITIVE_KEY_TYPES = (int, float, bool, str, type(None))
@@ -1250,6 +1254,12 @@ def _kernel_impl(_func, level_of_class_stackframe, verbose=False):
             # If we reach here (we should never), it means the class is not decorated
             # with @ti.data_oriented, otherwise getattr would have intercepted the call.
             clsobj = type(args[0])
+            if _LAUNCH_FASTPATH and any(klass in _FAST_DATA_ORIENTED for klass in clsobj.__mro__):
+                # Fast path d: an instance of a class on it reached this kernel through a plain bound method, under a
+                # name that held no kernel when its class was decorated (an alias set later); the 1.7.4 hook bound
+                # any such name to the instance, and this calls what it bound (see data_oriented).
+                wrapped._is_staticmethod = False
+                return _BoundedDifferentiableMethod(args[0], wrapped)(*args[1:], **kwargs)
             assert not hasattr(clsobj, "_data_oriented")
             raise TaichiSyntaxError(f"Please decorate class {clsobj.__name__} with @ti.data_oriented")
 
@@ -1357,7 +1367,29 @@ def data_oriented(cls):
 
     Returns:
         The decorated class.
+
+    Fast path d of the fork (FORK.md change 7): unless TI_LAUNCH_FASTPATH=0, the class gets no __getattribute__ but a
+    _DataOrientedKernel descriptor for each name whose reads the 1.7.4 hook changed (_hook_changes: its kernels, own
+    or inherited from any base, and the values the hook tested) and a __setattr__ that gives a name a descriptor when
+    an instance stores a kernel under it, when its instances then read every attribute as Taichi 1.7.4's hook gave it
+    (_keeps_hook_semantics). A descriptor is callable, introspects and answers attribute reads as the entry it stands
+    for. A class or subclass that would read differently, or a class decorated after a decorated subclass, hands its
+    decorated hierarchies back to the 1.7.4 hook and takes fast path d's entries out of their classes (_revert); a class
+    decorated after an undecorated subclass was made handles that subclass too. FORK.md change 7 lists the differences
+    from 1.7.4; one is that a kernel set on a class after the class was made reads as a plain bound method, which runs
+    the kernel for the instance when called, as the hook's bound kernel did (the safety net in _kernel_impl).
     """
+    if _LAUNCH_FASTPATH and _data_oriented_fast(cls):
+        return cls
+    cls.__getattribute__ = _data_oriented_hook(cls)
+    cls._data_oriented = True
+
+    return cls
+
+
+def _data_oriented_hook(cls):
+    """Taichi 1.7.4's __getattribute__ of a data-oriented class (kernel_impl.py:1214-1237 at v1.7.4, unchanged): every
+    attribute read of an instance runs it, and every kernel read builds a new _BoundedDifferentiableMethod."""
 
     def _getattr(self, item):
         method = cls.__dict__.get(item, None)
@@ -1384,10 +1416,546 @@ def data_oriented(cls):
             return x(self)
         return x
 
-    cls.__getattribute__ = _getattr
-    cls._data_oriented = True
+    return _getattr
 
-    return cls
+
+# Fast path d.  Its state goes with the classes: a decorated class on fast path d -> a weak reference to the root
+# (first decorated class) of its hierarchy; the classes fast path d has handled; the roots whose hierarchy went back to
+# the 1.7.4 hook.
+_FAST_DATA_ORIENTED = weakref.WeakKeyDictionary()
+_HANDLED_CLASSES = weakref.WeakSet()
+_REVERTED_ROOTS = weakref.WeakSet()
+_MISSING = object()
+_LOOKUP_EACH_READ = object()  # the source_entry of a descriptor that runs the 1.7.4 lookup at every read
+_THIS_DESCRIPTOR = object()  # the source_entry of a descriptor made for the class __dict__ in which the lookup found it
+# The interpreter's method descriptors: their reads give builtin methods, which never answer to _is_wrapped_kernel. A
+# slot of __slots__ (a member descriptor) or a getset holds or computes any value, so the hook tested it.
+_NATIVE_METHOD_DESCRIPTORS = (
+    types.WrapperDescriptorType,
+    types.MethodDescriptorType,
+    types.ClassMethodDescriptorType,
+)
+
+
+def _delete_message():
+    """The message of the AttributeError that deleting a missing instance attribute raises on this Python when the class
+    has a method of that name ("name" on 3.10), as a format string with {type} and {name}."""
+
+    class _DeleteProbe:
+        def _delete_probe_name(self):
+            pass
+
+    try:
+        del _DeleteProbe()._delete_probe_name
+    except AttributeError as error:
+        return str(error).replace("_DeleteProbe", "{type}").replace("_delete_probe_name", "{name}")
+    return "{name}"
+
+
+_DELETE_MESSAGE = _delete_message()
+
+
+class _DataOrientedKernel:
+    """Fast path d: the class attribute `name` of a data-oriented class, or of a subclass, whose reads Taichi 1.7.4's
+    hook changed: a kernel (plain, staticmethod or classmethod; own or inherited) or another value that answers to
+    _is_wrapped_kernel, whose read the hook bound or tested; a property or another descriptor of a class the hook did
+    not special-case, whose value went through that test; or a name an instance stored such a value under
+    (_install_instance_name). Reading it from an instance gives what the hook gave, reading it from the class what the
+    class lookup gave, and setting and deleting do what they did (a data descriptor keeps its precedence over the
+    instance __dict__). When the class __dict__ in which the lookup found the attribute holds something else now (a
+    test replaced a kernel), or a class between that class and this descriptor's holds an entry of the name now (a test
+    patched a mixin earlier in the MRO), a read runs the 1.7.4 lookup again, with the _is_staticmethod the hook took
+    then. Where
+    Class.__dict__ and inspect.getattr_static gave the entry raw in 1.7.4, they give the descriptor: it stands for raw
+    there. Attribute reads it cannot answer itself go to raw (__getattr__, and the properties __doc__ and __module__,
+    which every class would answer), inspect.signature and inspect.unwrap reach raw through __wrapped__, and the
+    descriptor is callable when raw is (_CallableDataOrientedKernel). What only the type can answer differs (FORK.md
+    change 7)."""
+
+    # __get__ reads one slot: __getattr__ gives this class CPython's slot_tp_getattr_hook, and with it every slot read
+    # loses LOAD_ATTR's cache (measured on one CPU thread: six slot reads made a kernel read 18 % slower). __get__ and
+    # __set__ themselves are found on the type, so a read or a set of the class's attribute never runs __getattr__.
+    __slots__ = ("name", "own", "raw", "state", "__weakref__")
+    __doc__ = property(lambda self: self.__getattr__("__doc__"))
+    __module__ = property(lambda self: self.__getattr__("__module__"))
+
+    def __init__(self, name, own, source, source_entry, raw, is_staticmethod, between=()):
+        self.name = name
+        self.own = own  # the entry of the class it sits in that it replaced, or _MISSING
+        self.raw = raw  # the class attribute as the 1.7.4 lookup found it, or _MISSING
+        kind = type(raw)
+        self.state = (
+            name,
+            source,  # the __dict__ (a live view) of the class in which the lookup found the attribute
+            self if source_entry is _THIS_DESCRIPTOR else source_entry,  # what that __dict__ held for the name then
+            not (hasattr(kind, "__get__") and (hasattr(kind, "__set__") or hasattr(kind, "__delete__"))),  # value first
+            raw if inspect.isfunction(raw) and getattr(raw, "_is_classkernel", False) is True else None,  # a kernel
+            is_staticmethod,  # the innermost decorated class's own entry is a staticmethod
+            raw,
+            between,  # the __dict__ views of the classes between this descriptor's class and source's, in MRO order
+        )
+
+    def __getattr__(self, attribute):
+        """An attribute of raw, the entry this descriptor stands for: Python comes here for what the type and the slots
+        do not answer. No such attribute where the class lookup found no entry, or on a copy whose slots are not set
+        yet (copy.copy asks for __setstate__ then), which a plain read of self.raw would turn into a recursion."""
+        try:
+            raw = object.__getattribute__(self, "raw")
+        except AttributeError:
+            raise AttributeError(attribute) from None
+        if raw is _MISSING:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{attribute}'")
+        return getattr(raw, attribute)
+
+    @property
+    def __wrapped__(self):
+        """raw, the entry this descriptor stands for, so that inspect.signature and inspect.unwrap reach it as they
+        reached it in Taichi 1.7.4; no such attribute where the class lookup found no entry."""
+        if self.raw is _MISSING:
+            raise AttributeError("__wrapped__")
+        return self.raw
+
+    def __get__(self, instance, owner=None):
+        name, source, source_entry, instance_first, function, is_staticmethod, raw, between = self.state
+        if instance is None:
+            if owner is None:
+                raise TypeError("__get__(None, None) is invalid")
+            return _class_lookup(owner, name)
+        # A source entry is never None: the hook changes no read of None. An entry between hides the source's.
+        relookup = source.get(name) is not source_entry
+        for namespace in between:
+            if name in namespace and _is_entry(namespace[name]):
+                relookup = True
+        if relookup:
+            flag = _current_flag(instance, name, is_staticmethod)
+            return _hook_value(instance, _instance_lookup(instance, name), flag)
+        if instance_first:
+            namespace = instance.__dict__
+            if name in namespace:
+                return _hook_value(instance, namespace[name], is_staticmethod)
+        if function is None:
+            bound = raw.__get__(instance, type(instance)) if hasattr(type(raw), "__get__") else raw
+            return _hook_value(instance, bound, is_staticmethod)
+        function._is_staticmethod = is_staticmethod
+        ret = _BoundedDifferentiableMethod(instance, function)
+        ret.__name__ = function.__name__
+        return ret
+
+    def __set__(self, instance, value):
+        name = self.name
+        entry = _first_entry(type(instance), name)
+        if _sets_and_deletes(entry):
+            setter = getattr(type(entry), "__set__", None)
+            if setter is None:
+                raise AttributeError("__set__")  # CPython's slot for a class that defines __delete__ only
+            setter(entry, instance, value)
+        else:
+            instance.__dict__[name] = value
+
+    def __delete__(self, instance):
+        name = self.name
+        entry = _first_entry(type(instance), name)
+        if _sets_and_deletes(entry):
+            deleter = getattr(type(entry), "__delete__", None)
+            if deleter is None:
+                raise AttributeError("__delete__")  # CPython's slot for a class that defines __set__ only
+            deleter(entry, instance)
+            return
+        try:
+            del instance.__dict__[name]
+        except KeyError:
+            raise AttributeError(_DELETE_MESSAGE.format(type=type(instance).__name__, name=name)) from None
+
+
+class _CallableDataOrientedKernel(_DataOrientedKernel):
+    """Fast path d: a _DataOrientedKernel whose raw is callable (a kernel, another function, a staticmethod). Calling
+    it calls raw, as a call of what Class.__dict__ or inspect.getattr_static gave did in Taichi 1.7.4; callable() is
+    true for it and false for a _DataOrientedKernel, as it was for raw (a classmethod, a property)."""
+
+    __slots__ = ()
+    __doc__ = _DataOrientedKernel.__dict__["__doc__"]  # a class's own __doc__ and __module__ hide its base's
+    __module__ = _DataOrientedKernel.__dict__["__module__"]
+
+    def __call__(self, *args, **kwargs):
+        return self.raw(*args, **kwargs)
+
+
+def _new_descriptor(name, own, source, source_entry, raw, is_staticmethod, between=()):
+    """The fast-path descriptor for name (_DataOrientedKernel's arguments): callable when raw is."""
+    kind = _CallableDataOrientedKernel if callable(raw) else _DataOrientedKernel
+    return kind(name, own, source, source_entry, raw, is_staticmethod, between)
+
+
+def _is_entry(found):
+    """Whether the class __dict__ value found is an entry as 1.7.4 had it: a fast-path descriptor that stands for an
+    inherited entry is none (a subclass of a decorated class holds one for each kernel it inherits)."""
+    return not isinstance(found, _DataOrientedKernel) or found.own is not _MISSING
+
+
+def _current_flag(instance, name, is_staticmethod):
+    """The _is_staticmethod that the 1.7.4 hook gave a value read now as name from instance: whether the own entry of
+    the hook that bound it, the innermost decorated class of type(instance) (the first decorated class of its hierarchy
+    on fast path d), is a staticmethod (kernel_impl.py:1217 at v1.7.4); the descriptor's own flag off fast path d."""
+    layers = _fast_layers(type(instance))
+    if not layers:
+        return is_staticmethod
+    return _own_entry(layers[-1], name).__class__ == staticmethod
+
+
+def _is_dunder(name):
+    """Whether name is a dunder name. Fast path d gives such a name no descriptor: one in a class __dict__ would change
+    what the interpreter's own lookups of special methods find (FORK.md change 7 lists the difference)."""
+    return name.startswith("__") and name.endswith("__")
+
+
+def _sets_and_deletes(entry):
+    """Whether the class attribute entry takes an instance's sets and deletes (its type defines __set__ or __delete__,
+    which gives it CPython's tp_descr_set), as object.__setattr__ and object.__delattr__ decide."""
+    kind = type(entry)
+    return entry is not _MISSING and (hasattr(kind, "__set__") or hasattr(kind, "__delete__"))
+
+
+def _hook_value(instance, x, is_staticmethod):
+    """What the 1.7.4 hook returned for a name outside its property branch whose lookup gave x
+    (kernel_impl.py:1222-1237 at v1.7.4). A descriptor that vars() or object.__setattr__ put into the instance __dict__
+    answers to _is_wrapped_kernel as its entry does; it is no kernel, and reads as itself (FORK.md change 7)."""
+    if hasattr(x, "_is_wrapped_kernel") and not isinstance(x, _DataOrientedKernel):
+        if inspect.ismethod(x):
+            wrapped = x.__func__
+        else:
+            wrapped = x
+        wrapped._is_staticmethod = is_staticmethod
+        assert inspect.isfunction(wrapped)
+        if wrapped._is_classkernel:
+            ret = _BoundedDifferentiableMethod(instance, wrapped)
+            ret.__name__ = wrapped.__name__
+            return ret
+    return x
+
+
+def _own_entry(klass, name):
+    """klass's own __dict__ entry for name as 1.7.4 had it: a fast-path descriptor stands for the entry it replaced,
+    or for no entry (_MISSING) when it stands for an inherited one."""
+    found = klass.__dict__.get(name, _MISSING)
+    if isinstance(found, _DataOrientedKernel):
+        return found.own
+    return found
+
+
+def _first_entry(owner, name):
+    """The first entry for name in owner.__mro__ as 1.7.4 had them, or _MISSING."""
+    for klass in owner.__mro__:
+        found = _own_entry(klass, name)
+        if found is not _MISSING:
+            return found
+    return _MISSING
+
+
+def _instance_lookup(instance, name):
+    """object.__getattribute__(instance, name) as it ran without fast-path descriptors: a data descriptor of the
+    class, then the instance __dict__, then any other class attribute (bound through its __get__)."""
+    owner = type(instance)
+    entry = _first_entry(owner, name)
+    kind = type(entry)
+    if entry is not _MISSING and hasattr(kind, "__get__") and (hasattr(kind, "__set__") or hasattr(kind, "__delete__")):
+        return entry.__get__(instance, owner)
+    value = instance.__dict__.get(name, _MISSING)
+    if value is not _MISSING:
+        return value
+    if entry is _MISSING:
+        raise AttributeError(f"'{owner.__name__}' object has no attribute '{name}'")
+    if hasattr(kind, "__get__"):
+        return entry.__get__(instance, owner)
+    return entry
+
+
+def _class_lookup(owner, name):
+    """type.__getattribute__(owner, name) as it ran without fast-path descriptors, for a name the metaclass does not
+    define."""
+    entry = _first_entry(owner, name)
+    if entry is _MISSING:
+        raise AttributeError(f"type object '{owner.__name__}' has no attribute '{name}'")
+    if hasattr(type(entry), "__get__"):
+        return entry.__get__(None, owner)
+    return entry
+
+
+def _hook_changes(name, raw, in_layer):
+    """Whether reading the class __dict__ entry raw (of a decorated class when in_layer) through an instance needs a
+    descriptor to give what the 1.7.4 hook gave. Yes for a function, staticmethod or classmethod that carries
+    _is_wrapped_kernel, a plain object that answers to it (a unittest.mock.Mock does), and a descriptor whose value is
+    known only when it is read (a property of a class that is not decorated, a slot, another descriptor): the hook
+    tested each value it read. No for a decorated class's own property (its branch of the hook is kept by
+    _keeps_hook_semantics), for the interpreter's method descriptors, and for dunder names (_is_dunder)."""
+    if _is_dunder(name):
+        return False
+    if raw.__class__ == property and in_layer:
+        return False
+    if isinstance(raw, (staticmethod, classmethod)):
+        raw = raw.__func__
+    elif isinstance(raw, _NATIVE_METHOD_DESCRIPTORS):
+        return False
+    elif not inspect.isfunction(raw) and hasattr(type(raw), "__get__"):
+        return True
+    try:
+        return hasattr(raw, "_is_wrapped_kernel")
+    except Exception:  # pylint: disable=broad-except
+        return True  # reading it raised: the descriptor's read raises it again, where the hook raised it
+
+
+def _install_kernel_descriptors(cls, layers):
+    """Fast path d: a _DataOrientedKernel in cls.__dict__ for each name whose lookup in cls.__mro__ finds an entry that
+    _hook_changes names, and the entry it replaced back for a name that needs none any more (cls was made undecorated
+    and is decorated now). `layers` are the decorated classes of cls.__mro__; the innermost, the last, was the hook
+    that bound a value, so its own entry for the name gave _is_staticmethod (kernel_impl.py:1217 at v1.7.4)."""
+    found = {}
+    for klass in cls.__mro__:
+        for name, entry in klass.__dict__.items():
+            if name in found:
+                continue
+            raw = entry.own if isinstance(entry, _DataOrientedKernel) else entry
+            if raw is not _MISSING:
+                found[name] = (klass, entry, raw)
+    innermost = layers[-1]
+    mro = cls.__mro__
+    views = tuple(klass.__dict__ for klass in mro)
+    for name, (klass, entry, raw) in found.items():
+        own = _own_entry(cls, name)
+        if not _hook_changes(name, raw, klass in layers):
+            if isinstance(cls.__dict__.get(name), _DataOrientedKernel):
+                if own is _MISSING:
+                    type.__delattr__(cls, name)
+                else:
+                    type.__setattr__(cls, name, own)
+            continue
+        is_staticmethod = _own_entry(innermost, name).__class__ == staticmethod
+        source_entry = _THIS_DESCRIPTOR if klass is cls else entry
+        between = views[1 : mro.index(klass)]
+        descriptor = _new_descriptor(name, own, klass.__dict__, source_entry, raw, is_staticmethod, between)
+        type.__setattr__(cls, name, descriptor)
+
+
+def _defines_getattribute(klass):
+    """Whether klass defines a __getattribute__ in Python (the 1.7.4 hook or another); a builtin's slot is no such."""
+    entry = klass.__dict__.get("__getattribute__", _MISSING)
+    return entry is not _MISSING and not isinstance(entry, types.WrapperDescriptorType)
+
+
+def _defines_setattr(klass):
+    """Whether klass defines a __setattr__ in Python other than fast path d's (_data_oriented_setattr)."""
+    entry = klass.__dict__.get("__setattr__", _MISSING)
+    return (
+        entry is not _MISSING
+        and not isinstance(entry, types.WrapperDescriptorType)
+        and not getattr(entry, "_data_oriented_setattr", False)
+    )
+
+
+def _data_oriented_setattr(root):
+    """Fast path d: the __setattr__ of root, the first decorated class of a hierarchy on it. It sets as before (the next
+    __setattr__ in the MRO); a descriptor as the value (what vars(Class) or inspect.getattr_static gives) stands for its
+    entry, which is what 1.7.4 was given, so the entry is set. When the value went into the instance __dict__ under a
+    name with no fast-path descriptor and answers to _is_wrapped_kernel (a kernel kept on the instance, a
+    unittest.mock.Mock), it gives the instance's class a descriptor for that name (_install_instance_name), so that
+    reading it gives what the 1.7.4 hook gave: the kernel bound to that instance, the hook's AssertionError, the hook's
+    _is_staticmethod; not for a dunder name (_is_dunder). A class whose __init_subclass__ chain skipped fast path d's
+    hook is handled at its instances' first set."""
+
+    def __setattr__(self, name, value):
+        cls = type(self)
+        if cls not in _HANDLED_CLASSES:
+            _data_oriented_subclass(cls)
+        if isinstance(value, _DataOrientedKernel) and value.raw is not _MISSING:
+            value = value.raw
+        super(root, self).__setattr__(name, value)
+        if self.__dict__.get(name, _MISSING) is not value:
+            return
+        try:
+            binds = hasattr(value, "_is_wrapped_kernel")
+        except Exception:  # pylint: disable=broad-except
+            binds = True  # reading it raised: the descriptor's read raises it again, where the hook raised it
+        if binds and not _is_dunder(name):
+            _install_instance_name(cls, name)
+
+    __setattr__._data_oriented_setattr = True
+    return __setattr__
+
+
+def _install_instance_name(cls, name):
+    """Fast path d: a _DataOrientedKernel for name on cls that runs the 1.7.4 lookup at every read (an instance value
+    first), unless the lookup of name in cls.__mro__ already finds one or cls's hierarchy went back to the hook. It
+    stands for the class attribute that the lookup of name in cls.__mro__ finds now, or none."""
+    layers = _fast_layers(cls)
+    if not layers:
+        return
+    for klass in cls.__mro__:
+        found = klass.__dict__.get(name, _MISSING)
+        if found is not _MISSING:
+            if isinstance(found, _DataOrientedKernel):
+                return
+            break
+    is_staticmethod = _own_entry(layers[-1], name).__class__ == staticmethod
+    descriptor = _new_descriptor(
+        name, _own_entry(cls, name), cls.__dict__, _LOOKUP_EACH_READ, _first_entry(cls, name), is_staticmethod
+    )
+    type.__setattr__(cls, name, descriptor)
+
+
+def _roots(layers):
+    """The roots of the hierarchies of the decorated classes `layers` that are on fast path d."""
+    return {_FAST_DATA_ORIENTED[layer]() for layer in layers if layer in _FAST_DATA_ORIENTED}
+
+
+def _keeps_hook_semantics(cls, layers):
+    """Whether an instance of cls reads every attribute as the 1.7.4 hooks of `layers` gave it (the decorated classes of
+    cls.__mro__, cls's own included when it is being decorated) once the descriptors are in place: no other
+    __getattribute__ or __setattr__ in cls.__mro__, an instance __dict__ (the descriptors keep instance attributes
+    there), one decorated hierarchy, no property in cls.__mro__ whose getter answers to _is_wrapped_kernel, no layer
+    property without a getter, and every property of a layer found first by the lookup (a layer's own property won
+    over any other definition of its name, kernel_impl.py:1215-1221 at v1.7.4). A class's own entries are read as 1.7.4
+    had them (_own_entry): __init_subclass__ puts a descriptor over a decorated subclass's own property before the
+    decoration comes here."""
+    if any(_defines_getattribute(klass) or _defines_setattr(klass) for klass in cls.__mro__) or cls.__dictoffset__ == 0:
+        return False
+    if len(_roots(layers)) > 1:
+        return False
+    for klass in cls.__mro__:
+        for name in klass.__dict__:
+            entry = _own_entry(klass, name)
+            if not isinstance(entry, property):
+                continue
+            try:
+                if hasattr(entry.fget, "_is_wrapped_kernel"):
+                    return False
+            except Exception:  # pylint: disable=broad-except
+                return False
+            if klass not in layers or entry.__class__ != property:
+                continue
+            if entry.fget is None:
+                return False
+            first = next(owner for owner in cls.__mro__ if _own_entry(owner, name) is not _MISSING)
+            if first not in layers or _own_entry(first, name).__class__ != property:
+                return False
+    return True
+
+
+def _fast_layers(cls):
+    """The decorated classes of cls.__mro__ on fast path d, in MRO order."""
+    return [klass for klass in cls.__mro__ if klass in _FAST_DATA_ORIENTED]
+
+
+def _revert(root):
+    """Hands the hierarchy of root back to Taichi 1.7.4: each of its decorated classes on fast path d gets the 1.7.4
+    __getattribute__, and each of its classes gets back what fast path d replaced in its __dict__ (_take_out), so that
+    the hierarchy reads, sets and introspects as in 1.7.4, also through a __getattribute__ that skips the hooks."""
+    if root in _REVERTED_ROOTS:
+        return
+    _REVERTED_ROOTS.add(root)
+    for klass in [root] + _classes_below(root):
+        reference = _FAST_DATA_ORIENTED.get(klass)
+        if reference is not None and reference() is root:
+            del _FAST_DATA_ORIENTED[klass]
+            type.__setattr__(klass, "__getattribute__", _data_oriented_hook(klass))
+        _take_out(klass)
+
+
+def _classes_below(cls):
+    """Every class below cls, each after its bases (a base's __mro__ is shorter than its subclass's)."""
+    found = set()
+    pending = [cls]
+    while pending:
+        for subclass in type.__subclasses__(pending.pop()):
+            if subclass not in found:
+                found.add(subclass)
+                pending.append(subclass)
+    return sorted(found, key=lambda klass: len(klass.__mro__))
+
+
+def _take_out(klass):
+    """Puts back into klass.__dict__ what fast path d replaced there: each descriptor's own entry (or no entry), the entry
+    it stands for where a descriptor was copied under another name, and the entry that fast path d's __setattr__ or
+    __init_subclass__ hook replaced (or none)."""
+    for name, entry in list(klass.__dict__.items()):
+        if isinstance(entry, _DataOrientedKernel):
+            kept = entry.own if entry.name == name else entry.raw
+            if kept is _MISSING:
+                type.__delattr__(klass, name)
+            else:
+                type.__setattr__(klass, name, kept)
+    if getattr(klass.__dict__.get("__setattr__"), "_data_oriented_setattr", False):
+        type.__delattr__(klass, "__setattr__")
+    hook = getattr(klass.__dict__.get("__init_subclass__"), "__func__", None)
+    if getattr(hook, "_data_oriented_subclass_hook", False):
+        if hook.previous is _MISSING:
+            type.__delattr__(klass, "__init_subclass__")
+        else:
+            type.__setattr__(klass, "__init_subclass__", hook.previous)
+
+
+def _revert_all(layers):
+    """Hands the hierarchies of the decorated classes `layers` back to Taichi 1.7.4 (_revert)."""
+    for root in _roots(layers):
+        _revert(root)
+
+
+def _data_oriented_fast(cls):
+    """Fast path d when cls is decorated: descriptors and no hook when cls keeps the 1.7.4 semantics with them and has
+    no decorated subclass on fast path d yet (True); otherwise the decorated hierarchies of cls.__mro__ and of its
+    subclasses go back to the 1.7.4 hook and cls gets it too (False): cls's hook would run under its subclass's, and
+    it, the innermost, bound each value, with cls's own flag (kernel_impl.py:1217 at v1.7.4). Subclasses made before cls
+    was decorated are handled as if they were made now."""
+    inherited = [klass for klass in _fast_layers(cls) if klass is not cls]
+    layers = [cls] + inherited
+    below = _classes_below(cls)
+    _HANDLED_CLASSES.add(cls)
+    if not _keeps_hook_semantics(cls, layers) or any(klass in _FAST_DATA_ORIENTED for klass in below):
+        _revert_all(layers + below)
+        return False
+    root = _FAST_DATA_ORIENTED[inherited[0]]() if inherited else cls
+    _FAST_DATA_ORIENTED[cls] = weakref.ref(root)
+    _install_kernel_descriptors(cls, layers)
+    cls._data_oriented = True
+    if root is cls:
+        _install_subclass_hook(cls)
+        type.__setattr__(cls, "__setattr__", _data_oriented_setattr(cls))
+    for subclass in below:
+        _data_oriented_subclass(subclass)
+    return True
+
+
+def _data_oriented_subclass(subclass):
+    """Fast path d when a subclass of a decorated class on it is made: descriptors for the subclass when it keeps the
+    1.7.4 semantics with them; otherwise its decorated hierarchies go back to the 1.7.4 hook. A subclass that brings its
+    own __init_subclass__ gets this hook around it, so that its subclasses come here too."""
+    _HANDLED_CLASSES.add(subclass)
+    layers = _fast_layers(subclass)
+    if not layers:
+        return
+    if "__init_subclass__" in subclass.__dict__:
+        _install_subclass_hook(subclass)
+    if not _keeps_hook_semantics(subclass, layers):
+        _revert_all(layers)
+        return
+    _install_kernel_descriptors(subclass, layers)
+
+
+def _install_subclass_hook(cls):
+    """Fast path d: cls.__init_subclass__ runs _data_oriented_subclass for each new subclass, after cls's own
+    __init_subclass__ or else the next one in the MRO, which it keeps."""
+    previous = cls.__dict__.get("__init_subclass__", _MISSING)
+    if getattr(getattr(previous, "__func__", None), "_data_oriented_subclass_hook", False):
+        return
+
+    def __init_subclass__(subclass, **kwargs):
+        if previous is _MISSING:
+            super(cls, subclass).__init_subclass__(**kwargs)
+        else:
+            previous.__get__(None, subclass)(**kwargs)
+        _data_oriented_subclass(subclass)
+
+    __init_subclass__._data_oriented_subclass_hook = True
+    __init_subclass__.previous = previous  # what _take_out puts back
+    type.__setattr__(cls, "__init_subclass__", classmethod(__init_subclass__))
 
 
 __all__ = ["data_oriented", "func", "kernel", "pyfunc", "real_func"]
