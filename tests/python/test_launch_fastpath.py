@@ -59,7 +59,7 @@ def test_the_marker_names_the_fork_and_its_switch():
     """taichi._fork is what a program that needs this fork reads: its name, its version (the core's release with the
     fork's local label, so the wheel and the core agree) and the switch this process runs with."""
     assert ti._fork is _fork
-    assert (_fork.NAME, _fork.VERSION, _fork.BASE) == ("lizhuoh9/taichi", "1.7.4+1", "v1.7.4")
+    assert (_fork.NAME, _fork.VERSION, _fork.BASE) == ("lizhuoh9/taichi", "1.7.4+2", "v1.7.4")
     assert _fork.VERSION.split("+")[0] == ".".join(str(part) for part in ti.__version__)
     assert isinstance(_fork.LAUNCH_FASTPATH, bool) and kernel_impl._LAUNCH_FASTPATH is _fork.LAUNCH_FASTPATH
 

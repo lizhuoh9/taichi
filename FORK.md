@@ -30,17 +30,25 @@ section 4b).
 2. The switch `TI_LAUNCH_FASTPATH`, read once when `taichi` is imported: unset or `1` turns the fast paths on, `0`
    turns them off (A/B timing within one installation), and any other value stops the import with a `ValueError`.
 3. The marker `taichi._fork` (`python/taichi/_fork.py`, imported by `python/taichi/__init__.py`): `NAME`
-   (`"lizhuoh9/taichi"`), `VERSION` (`"1.7.4+1"`), `BASE` (`"v1.7.4"`) and `LAUNCH_FASTPATH`. A program that
+   (`"lizhuoh9/taichi"`), `VERSION` (`"1.7.4+2"`), `BASE` (`"v1.7.4"`) and `LAUNCH_FASTPATH`. A program that
    needs the fork reads it; stock Taichi has no `taichi._fork`. The underscore keeps Taichi's public namespace as
    released.
 4. Tests: `tests/python/test_launch_fastpath.py` compares every argument kind, value, return value and error with the
    fast paths on and off, the kept data's lifetime across `ti.init`, `ti.reset` and `SNodeTree.destroy`, the
    compile-config write and the switch.
 5. `misc/fork_repack_wheel.py` builds the fork's wheel (below).
+6. `ScalarNdarray.__del__` (`python/taichi/lang/_ndarray.py`) deletes its ndarray only on the program that created
+   it, named by a weak reference to that program's runtime (`ti.init` and `ti.reset` replace the runtime). Taichi
+   1.7.4 passed the pointer to the current program's `delete_ndarray`: an ndarray of an earlier program that Python
+   freed after the next `ti.init` then erased whichever live ndarray of the current program had reused its address,
+   and the next kernel that took it failed with "invalid DeviceAllocation". The tests in
+   `tests/python/test_ndarray_program_delete.py` check the delete calls, the runtime's lifetime and the failure
+   itself. `ArgPack.__del__` and `SparseMatrixBuilder.__del__` follow the same pattern as 1.7.4's and are unchanged.
 
 ## Versions
 
 - `1.7.4+1`: changes 1 to 5.
+- `1.7.4+2`: change 6 added.
 
 ## Wheels
 
@@ -65,6 +73,6 @@ byte. The sha256 above is PyPI's for the official CPython 3.10 Linux wheel of 1.
 Releases of the fork attach the wheel for Linux x86-64 and CPython 3.10, the only combination tested. The script can make the
 wheels of the other official platforms and Python versions; they are untested.
 
-Install it with `pip install taichi-1.7.4+1-cp310-cp310-manylinux_2_27_x86_64.whl`, into the environment first. A later
+Install it with `pip install taichi-1.7.4+2-cp310-cp310-manylinux_2_27_x86_64.whl`, into the environment first. A later
 `pip install taichi` or `pip install -r` with `taichi==1.7.4` keeps it (a local label satisfies that pin). What replaces it is an
 explicit request for the official wheel, such as `pip install --force-reinstall taichi==1.7.4`; afterwards `taichi._fork` is gone.

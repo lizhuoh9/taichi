@@ -1,3 +1,7 @@
+# Changed in the fork lizhuoh9/taichi on 2026-11-06 (see FORK.md): ScalarNdarray.__del__ deletes its ndarray only on
+# the program that created it; Taichi 1.7.4 could free a live ndarray of the next program.
+import weakref
+
 import numpy as np
 from taichi._lib import core as _ti_core
 from taichi.lang import impl
@@ -237,15 +241,27 @@ class ScalarNdarray(Ndarray):
     def __init__(self, dtype, arr_shape):
         super().__init__()
         self.dtype = cook_dtype(dtype)
-        self.arr = impl.get_runtime().prog.create_ndarray(
+        runtime = impl.get_runtime()
+        self.arr = runtime.prog.create_ndarray(
             self.dtype, arr_shape, layout=Layout.NULL, zero_fill=True, dbg_info=_ti_core.DebugInfo(get_traceback())
         )
+        # The runtime whose program owns self.arr, held weakly.  ti.init and ti.reset replace the runtime, and a
+        # runtime creates at most one program, so the runtime names the program.  A weak reference never matches a
+        # later object, whereas id() or an address can be reused.
+        self._runtime_ref = weakref.ref(runtime)
         self.shape = tuple(self.arr.shape)
         self.element_type = dtype
 
     def __del__(self):
-        if impl is not None and impl.get_runtime() is not None and impl.get_runtime().prog is not None:
-            impl.get_runtime().prog.delete_ndarray(self.arr)
+        # Delete self.arr only on the program that created it.  Once that program is gone (ti.reset, or the next
+        # ti.init), self.arr is already freed and a new ndarray may sit at its address; Taichi 1.7.4 passed the
+        # pointer to the current program's delete_ndarray, which then freed that live ndarray.
+        runtime = impl.get_runtime() if impl is not None else None
+        if runtime is None or runtime.prog is None:
+            return
+        created_by = getattr(self, "_runtime_ref", None)  # None when create_ndarray raised
+        if created_by is not None and created_by() is runtime:
+            runtime.prog.delete_ndarray(self.arr)
 
     @property
     def element_shape(self):
