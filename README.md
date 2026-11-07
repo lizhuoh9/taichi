@@ -11,7 +11,8 @@
 >   pip install "https://github.com/lizhuoh9/taichi/releases/download/v1.7.4%2B4/taichi-1.7.4%2B4-cp310-cp310-manylinux_2_27_x86_64.whl#sha256=5ad448db01af8d124ef67cf43ab049708dab8e89584b7dec3898638e5909f9c5"
 >   ```
 >   A later `pip install taichi` keeps it.
-> - **Tested on:** Linux x86-64, CPython 3.10: the CPU backend, and CUDA on an NVIDIA GeForce RTX 3090 (compute capability 8.6).
+> - **Tested on:** Linux x86-64, CPython 3.10: the CPU backend, and CUDA on an NVIDIA GeForce RTX 3090 (compute capability 8.6)
+>   and an NVIDIA GeForce GTX 1660 (compute capability 7.5, under WSL2).
 > - **Binaries:** the C++ binaries are the official 1.7.4 wheel's, byte for byte; `misc/fork_repack_wheel.py` builds the wheel from it.
 > - **Switch:** `TI_LAUNCH_FASTPATH=0` in the environment turns the fast paths off, for comparisons.
 > - **License:** Apache-2.0, as Taichi; each changed code file has a header comment saying what changed and when.
