@@ -30,7 +30,7 @@ section 4b).
 2. The switch `TI_LAUNCH_FASTPATH`, read once when `taichi` is imported: unset or `1` turns the fast paths on, `0`
    turns them off (A/B timing within one installation), and any other value stops the import with a `ValueError`.
 3. The marker `taichi._fork` (`python/taichi/_fork.py`, imported by `python/taichi/__init__.py`): `NAME`
-   (`"lizhuoh9/taichi"`), `VERSION` (`"1.7.4+3"`), `BASE` (`"v1.7.4"`) and `LAUNCH_FASTPATH`. A program that
+   (`"lizhuoh9/taichi"`), `VERSION` (`"1.7.4+4"`), `BASE` (`"v1.7.4"`) and `LAUNCH_FASTPATH`. A program that
    needs the fork reads it; stock Taichi has no `taichi._fork`. The underscore keeps Taichi's public namespace as
    released.
 4. Tests: `tests/python/test_launch_fastpath.py` compares every argument kind, value, return value and error with the
@@ -171,12 +171,33 @@ section 4b).
    The tests in `tests/python/test_data_oriented_fastpath.py` compare every read, call, error, template key, class
    attribute, signature and attribute read of a class entry with the fast path on and off, check each difference and
    each case handed back to the hook.
+8. Fast path e and fast path c inline (`python/taichi/lang/kernel_impl.py`), under the switch of change 2.
+   `Kernel.__call__` sends a primal kernel called with one positional argument per parameter (none of them
+   `inspect.Parameter.empty`), outside `ti.ad.FwdMode` and `ti.ad.Tape`, straight to `ensure_compiled` and
+   `launch_kernel`: for such a call 1.7.4's `_process_args` returns the arguments and its forward-mode, tape and
+   `opt_level` branches do nothing. Every other call takes 1.7.4's code: keywords, a missing or an extra argument, a
+   gradient or forward-mode kernel, a call inside a tape or forward mode. Fast path c's launch is written inside
+   `launch_kernel`, so a launch takes no further Python frame. It returns and raises what 1.7.4 does; the tests in
+   `tests/python/test_launch_fastpath_call.py` compare calls and their errors, a tape's record and gradient, forward
+   mode and a gradient kernel, with the fast paths on and off.
+9. Fast path f, the template key reused (`python/taichi/lang/kernel_impl.py`), under the switch of change 2.
+   `TaichiCallableTemplateMapper.lookup` returns its last result while every argument that the key holds, or holds a
+   weak reference to, is the same object as at that lookup. It applies to a kernel or function whose non-template
+   parameters are all keyed `'#'` (no ndarray, texture, argument pack or sparse matrix builder parameter: their keys
+   follow the argument's state) and to template arguments that fast path a keys by the argument itself or by a weak
+   reference to it; a tuple or another object that Taichi keys per instance takes the full key. The reused result
+   holds no more than 1.7.4's mapping holds: an argument kept in the key is alive, so no other object can have its
+   identity, and a weak reference to a dead object never matches (it gives `None`, which is a template argument of
+   its own); Taichi never changes an entry of the mapping. It returns and raises what 1.7.4 does; the tests in
+   `tests/python/test_launch_fastpath_key.py` count the key extractions and compare every result, key and kernel
+   instance with the fast paths on and off, also for `None` after a dead weakly keyed argument.
 
 ## Versions
 
 - `1.7.4+1`: changes 1 to 5.
 - `1.7.4+2`: change 6 added.
 - `1.7.4+3`: change 7 added.
+- `1.7.4+4`: changes 8 and 9 added.
 
 ## Wheels
 
@@ -202,6 +223,6 @@ Releases of the fork attach the wheel for Linux x86-64 and CPython 3.10, the onl
 wheels of the other official platforms and Python versions; they are untested, and the descriptors of change 7 lean on CPython's
 behaviour.
 
-Install it with `pip install taichi-1.7.4+3-cp310-cp310-manylinux_2_27_x86_64.whl`, into the environment first. A later
+Install it with `pip install taichi-1.7.4+4-cp310-cp310-manylinux_2_27_x86_64.whl`, into the environment first. A later
 `pip install taichi` or `pip install -r` with `taichi==1.7.4` keeps it (a local label satisfies that pin). What replaces it is an
 explicit request for the official wheel, such as `pip install --force-reinstall taichi==1.7.4`; afterwards `taichi._fork` is gone.
