@@ -1,3 +1,5 @@
+# Changed in the fork lizhuoh9/taichi on 2026-11-06 (see FORK.md): re-exports the fork's marker taichi._fork.
+from taichi import _fork
 from taichi._funcs import *
 from taichi._lib import core as _ti_core
 from taichi._lib.utils import warn_restricted_version

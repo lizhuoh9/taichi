@@ -1,3 +1,5 @@
+# Changed in the fork lizhuoh9/taichi on 2026-11-06 (see FORK.md): launch fast paths in extract_arg, _process_args and
+# Kernel.launch_kernel, on unless TI_LAUNCH_FASTPATH=0; they return and raise what Taichi 1.7.4 returns and raises.
 import ast
 import functools
 import inspect
@@ -49,6 +51,23 @@ from taichi.types.compound_types import CompoundType
 from taichi.types.utils import is_signed
 
 from taichi import _logging
+from taichi._fork import LAUNCH_FASTPATH as _LAUNCH_FASTPATH
+
+# The launch fast paths of the fork (FORK.md), each of which hands every case it does not cover to Taichi's code:
+#   a. TaichiCallableTemplateMapper.extract_arg keys a template argument by a decision made once per type;
+#   b. _process_args returns a call's positional arguments when they fill every parameter;
+#   c. Kernel.launch_kernel launches a kernel whose non-template parameters are all primitive scalars with a plan made
+#      at its first launch, and keeps each compiled kernel's CompiledKernelData for its program.
+# _LAUNCH_FASTPATH is taichi._fork.LAUNCH_FASTPATH: TI_LAUNCH_FASTPATH=0 at import turns all three off.
+_KEY_FROM_RELEASED_BRANCHES, _KEY_IS_ARGUMENT, _KEY_IS_WEAK_REFERENCE = 0, 1, 2
+_TEMPLATE_KEY_KINDS = {}  # a. type -> one of the three kinds above
+_PRIMITIVE_KEY_TYPES = (int, float, bool, str, type(None))
+_EMPTY = inspect.Parameter.empty
+_SCALAR_REAL, _SCALAR_SIGNED, _SCALAR_UNSIGNED = 0, 1, 2
+_REAL_ARGUMENT_TYPES = (float, int, np.floating, np.integer)  # what launch_kernel accepts for a real parameter
+_INTEGER_ARGUMENT_TYPES = (int, np.integer)  # and for an integer parameter
+_MAX_ARG_NUM = 64  # launch_kernel's limit on argument slots
+_UNPLANNED = object()
 
 
 def func(fn, is_real_function=False):
@@ -161,6 +180,14 @@ def _get_tree_and_ctx(
 
 
 def _process_args(self, args, kwargs):
+    if _LAUNCH_FASTPATH and not kwargs and len(args) == len(self.arguments):
+        # Fast path b: positional arguments only, one per parameter and none of them inspect.Parameter.empty; the
+        # loops below would return the list of the arguments.  Every other call takes them, and their errors.
+        for arg in args:
+            if arg is _EMPTY:
+                break
+        else:
+            return list(args)
     ret = [argument.default for argument in self.arguments]
     len_args = len(args)
 
@@ -373,6 +400,40 @@ class Func:
             self.arguments.append(KernelArgument(annotation, param.name, param.default))
 
 
+def _template_key_kind(arg_type):
+    """How the released branches of TaichiCallableTemplateMapper.extract_arg key every instance of arg_type as a
+    template argument (fast path a).
+
+    _KEY_IS_ARGUMENT: the instance itself, for int, float, bool, str and None, NumPy's scalar types other than the
+    structured np.void and np.record (whose fields belong to each instance), and Taichi's field classes with plain
+    attribute lookup.  _KEY_IS_WEAK_REFERENCE: a weak reference to it, for classes with a _data_oriented attribute of
+    their own or of a base (what an instance finds; a metaclass's attribute is not).  _KEY_FROM_RELEASED_BRANCHES for
+    the types of the released branches (SNode, Expr, tuple, Ndarray, list, dict, set) and every type not listed: those
+    keys are made per instance.  The decision is made at a type's first call; a class changed afterwards keeps it.
+    """
+    # Imported here: the attribute taichi.lang.field is the function ti.field, not the module.
+    from taichi.lang.field import Field  # pylint: disable=C0415
+
+    own_branches = (taichi.lang.snode.SNode, Expr, _ti_core.Expr, tuple, taichi.lang._ndarray.Ndarray, list, dict, set)
+    if issubclass(arg_type, own_branches):
+        return _KEY_FROM_RELEASED_BRANCHES
+    if any("_data_oriented" in vars(klass) for klass in arg_type.__mro__):
+        return _KEY_IS_WEAK_REFERENCE
+    if arg_type in _PRIMITIVE_KEY_TYPES:
+        return _KEY_IS_ARGUMENT
+    if (
+        issubclass(arg_type, np.generic)
+        and not issubclass(arg_type, np.void)
+        and arg_type.__module__ == "numpy"
+        and arg_type.__dictoffset__ == 0
+    ):
+        return _KEY_IS_ARGUMENT  # NumPy's scalar types: no instance attributes and no fields
+    plain_lookup = arg_type.__getattribute__ is object.__getattribute__ and not hasattr(arg_type, "__getattr__")
+    if issubclass(arg_type, Field) and plain_lookup:
+        return _KEY_IS_ARGUMENT
+    return _KEY_FROM_RELEASED_BRANCHES
+
+
 class TaichiCallableTemplateMapper:
     def __init__(self, arguments, template_slot_locations):
         self.arguments = arguments
@@ -383,6 +444,16 @@ class TaichiCallableTemplateMapper:
     @staticmethod
     def extract_arg(arg, anno, arg_name):
         if isinstance(anno, template):
+            if _LAUNCH_FASTPATH:
+                # Fast path a: the key that the branches below give every instance of this type
+                arg_type = type(arg)
+                kind = _TEMPLATE_KEY_KINDS.get(arg_type)
+                if kind is None:
+                    kind = _TEMPLATE_KEY_KINDS[arg_type] = _template_key_kind(arg_type)
+                if kind == _KEY_IS_ARGUMENT:
+                    return arg
+                if kind == _KEY_IS_WEAK_REFERENCE:
+                    return weakref.ref(arg)
             if isinstance(arg, taichi.lang.snode.SNode):
                 return arg.ptr
             if isinstance(arg, taichi.lang.expr.Expr):
@@ -559,6 +630,7 @@ class Kernel:
         self.kernel_cpp = None
         self.compiled_kernels = {}
         self.has_print = False
+        self._scalar_launch_plan = _UNPLANNED  # fast path c, made at the first launch
 
     def ast_builder(self):
         assert self.kernel_cpp is not None
@@ -567,6 +639,9 @@ class Kernel:
     def reset(self):
         self.runtime = impl.get_runtime()
         self.compiled_kernels = {}
+        # Fast path c: (program, {compiled kernel: CompiledKernelData}).  impl.reset() calls this for every kernel at
+        # ti.init and ti.reset, so no kept data outlives its program (Taichi frees it when the program is finalized).
+        self._kept_compiled_kernel_data = None
 
     def extract_arguments(self):
         sig = inspect.signature(self.func)
@@ -682,7 +757,80 @@ class Kernel:
         assert key not in self.compiled_kernels
         self.compiled_kernels[key] = taichi_kernel
 
+    def _make_scalar_launch_plan(self):
+        """Fast path c's plan for a kernel whose non-template parameters are all primitive scalars, at most
+        _MAX_ARG_NUM: (the parameter count, per scalar parameter (its position, its launch-context indices,
+        _SCALAR_REAL, _SCALAR_SIGNED or _SCALAR_UNSIGNED, its annotation)); None for every other kernel.  The
+        signedness is launch_kernel's is_signed(cook_dtype(annotation)): for Python's int that is the runtime's default
+        integer type, signed either way."""
+        setters, template_count = [], 0
+        for position, argument in enumerate(self.arguments):
+            needed = argument.annotation
+            if isinstance(needed, template):
+                template_count += 1
+                continue
+            if id(needed) in primitive_types.real_type_ids:
+                kind = _SCALAR_REAL
+            elif id(needed) in primitive_types.integer_type_ids:
+                kind = _SCALAR_SIGNED if is_signed(cook_dtype(needed)) else _SCALAR_UNSIGNED
+            else:
+                return None
+            setters.append((position, (position - template_count,), kind, needed))
+        if len(setters) > _MAX_ARG_NUM:
+            return None
+        return len(self.arguments), tuple(setters)
+
+    def _compiled_kernel_data(self, prog, t_kernel):
+        """Fast path c: the CompiledKernelData of a compiled kernel, asked of the program once and then kept.  Taichi
+        launches a compiled kernel with the data of its first compilation, also after a compile-config write such as
+        autodiff's opt_level 0 -> 1 in __call__; the data is kept per program and compiled kernel."""
+        kept = self._kept_compiled_kernel_data
+        if kept is None or kept[0] is not prog:
+            kept = self._kept_compiled_kernel_data = (prog, {})
+        compiled = kept[1].get(t_kernel)
+        if compiled is None:
+            compiled = kept[1][t_kernel] = prog.compile_kernel(prog.config(), prog.get_device_caps(), t_kernel)
+        return compiled
+
+    def _launch_with_scalar_plan(self, t_kernel, setters, args):
+        """Fast path c: launch_kernel for a kernel with a scalar plan (_make_scalar_launch_plan); the same checks,
+        errors, conversions, setters, sync and return values as launch_kernel's general path."""
+        launch_ctx = t_kernel.make_launch_context()
+        for position, indices, kind, needed in setters:
+            value = args[position]
+            if kind == _SCALAR_REAL:
+                if not isinstance(value, _REAL_ARGUMENT_TYPES):
+                    raise TaichiRuntimeTypeError.get(indices, needed.to_string(), type(value))
+                launch_ctx.set_arg_float(indices, float(value))
+            elif not isinstance(value, _INTEGER_ARGUMENT_TYPES):
+                raise TaichiRuntimeTypeError.get(indices, needed.to_string(), type(value))
+            elif kind == _SCALAR_SIGNED:
+                launch_ctx.set_arg_int(indices, int(value))
+            else:
+                launch_ctx.set_arg_uint(indices, int(value))
+        try:
+            prog = impl.get_runtime().prog
+            prog.launch_kernel(self._compiled_kernel_data(prog, t_kernel), launch_ctx)
+        except Exception as e:
+            e = handle_exception_from_cpp(e)
+            if impl.get_runtime().print_full_traceback:
+                raise e
+            raise e from None
+        ret_dt = self.return_type
+        if ret_dt is not None or self.has_print:
+            runtime_ops.sync()
+        if ret_dt is None:
+            return None
+        ret = [self.construct_kernel_ret(launch_ctx, ret_type, (i,)) for i, ret_type in enumerate(ret_dt)]
+        return ret[0] if len(ret_dt) == 1 else ret
+
     def launch_kernel(self, t_kernel, *args):
+        if _LAUNCH_FASTPATH:
+            plan = self._scalar_launch_plan
+            if plan is _UNPLANNED:
+                plan = self._scalar_launch_plan = self._make_scalar_launch_plan()
+            if plan is not None and len(args) == plan[0]:
+                return self._launch_with_scalar_plan(t_kernel, plan[1], args)
         assert len(args) == len(self.arguments), f"{len(self.arguments)} arguments needed but {len(args)} provided"
 
         tmps = []
@@ -690,7 +838,7 @@ class Kernel:
 
         actual_argument_slot = 0
         launch_ctx = t_kernel.make_launch_context()
-        max_arg_num = 64
+        max_arg_num = _MAX_ARG_NUM
         exceed_max_arg_num = False
 
         def set_arg_ndarray(indices, v):
