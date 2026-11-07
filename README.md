@@ -1,3 +1,16 @@
+> **This is an unofficial fork of [Taichi](https://github.com/taichi-dev/taichi), not affiliated with the Taichi project.**
+> It is based on the upstream tag `v1.7.4`. Below this block the README is upstream's.
+>
+> - **What is different:** less Python work per kernel call, faster reads of a data-oriented object's attributes, and one bug fix
+>   (an ndarray freed on the wrong program). Results stay bit for bit on the CPU. [FORK.md](FORK.md) has every change, every difference
+>   from Taichi 1.7.4 and what was measured, on which machine.
+> - **Install:** take the wheel from this repository's [releases](https://github.com/lizhuoh9/taichi/releases), then
+>   `pip install taichi-1.7.4+4-cp310-cp310-manylinux_2_27_x86_64.whl`. A later `pip install taichi` keeps it.
+> - **Tested on:** Linux x86-64, CPython 3.10, the CPU backend.
+> - **Binaries:** the C++ binaries are the official 1.7.4 wheel's, byte for byte; `misc/fork_repack_wheel.py` builds the wheel from it.
+> - **Switch:** `TI_LAUNCH_FASTPATH=0` in the environment turns the fast paths off, for comparisons.
+> - **License:** Apache-2.0, as Taichi; each changed code file has a header comment saying what changed and when.
+
 <div align="center">
   <img width="500px" src="https://github.com/taichi-dev/taichi/raw/master/misc/logo.png"/>
 </div>

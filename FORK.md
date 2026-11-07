@@ -10,13 +10,33 @@ Taichi project. Taichi is licensed under the Apache License 2.0 (`LICENSE`, unch
 - The fork changes Python files only. The C++ core is the release's: the fork's wheel carries the official wheel's binaries byte
   for byte, so `ti.__version__` stays `(1, 7, 4)`. The fork's own version is `taichi._fork.VERSION`.
 
+## Versions
+
+A version is Taichi's release, then a local label that counts the fork's rounds of changes: `1.7.4+4` is the fourth round on Taichi
+1.7.4. A local label satisfies `taichi==1.7.4` (PEP 440), and no public index carries one, so it never collides with an official
+release. The first two rounds were released under other labels, and `1.7.4+3` was never released on its own.
+
+| Version | What changed | Measured |
+|---|---|---|
+| `1.7.4+1` | Less Python work per kernel call: a template argument's key is decided once per type, positional arguments pass straight through, and a kernel with only scalar parameters launches with a plan made at its first launch. Adds the marker `taichi._fork`, the switch `TI_LAUNCH_FASTPATH` and the wheel tool (changes 1 to 5). | [A], official 1.7.4 to `+1`, host microseconds per call: 9.38 to 5.58, 16.32 to 6.17, 51.64 to 21.31 on the CPU backend ([M1]); 24.84 to 18.48, 33.97 to 19.25, 83.88 to 50.34 on CUDA ([M2]). A quasi-2-D fluid-structure case on a 4 x 144 x 864 grid (2,034 kernel launches in a step at 48 solver iterations; the timed steps ran 16 or 32), with the same fast paths as a patch on the official wheel, two pairs of runs each: 0.66 of the step time at the same mix of solver iterations ([M3], the host bounds the step: GPU 37 % busy, then 55 %); 0.977 ([M2], the GPU bounds the step: 89 % busy, then 90 %). |
+| `1.7.4+2` | A bug fix: an ndarray of an earlier program, freed by Python after the next `ti.init`, could free a live ndarray of the current program (change 6). | No speed change is claimed. On the official wheel the test's scenario freed 0 to 4 of 256 live ndarrays per run, over 5 runs ([M1]). |
+| `1.7.4+3` | A data-oriented class gets a descriptor for each kernel instead of a `__getattribute__` hook, so reading a field or any other plain attribute of an instance is Python's own lookup (change 7). Attribute writes on an instance cost more. | `+2` to an earlier draft of `+3`, microseconds per operation, beside a CPU test suite ([M1]): field read 0.344 to 0.010, kernel read 0.946 to 0.503, attribute write 0.022 to 0.402. Kernel read on a class with 26 classes in its MRO, weighted by a real step's launches, `+2` to `+3`: 1.126 to 0.643, on one thread of the [M1] host with no Taichi backend started, beside a GPU job. |
+| `1.7.4+4` | A leaner `Kernel.__call__` and launch, and the template key of a kernel's last call reused while its arguments repeat (changes 8 and 9). | An earlier draft of `+3` to that draft with changes 8 and 9, host microseconds per call, beside a test suite ([M1]): [A] 5.95 to 4.93, 6.75 to 5.07, 22.68 to 13.09. |
+
+[A] is one kernel without arguments, a data-oriented method without arguments, and a data-oriented method with 20 field and 8 scalar
+arguments, in that order: the host time per call, medians over rotations of the arms.
+
+- [M1]: one thread of an AMD Ryzen 9 5950X, CPU backend, Linux 6.6 under WSL2, CPython 3.10.12.
+- [M2]: the same host with an NVIDIA GeForce 1660 (6 GB) on CUDA.
+- [M3]: an AMD EPYC 7352 host with an NVIDIA RTX 3090 on CUDA.
+
 ## Changes
 
 Every code file the fork changes or adds carries a header comment with the date and a one-line summary (Apache-2.0,
 section 4b).
 
 1. Launch fast paths in `python/taichi/lang/kernel_impl.py`, on by default. Taichi's host time per kernel call is about 9 to 52
-   microseconds on the CPU backend of an AMD Ryzen 9 5950X, much of it Python that repeats at every call, and it bounds the step of a
+   microseconds on the CPU backend (the table above), much of it Python that repeats at every call, and it bounds the step of a
    program that launches many small kernels per step. Each fast path returns what Taichi 1.7.4 returns and raises what it raises, except the
    differences listed under change 7, and hands every case it does not cover to Taichi's code:
    - `TaichiCallableTemplateMapper.extract_arg` keys a template argument by a decision made once per type (the
@@ -191,13 +211,6 @@ section 4b).
    its own); Taichi never changes an entry of the mapping. It returns and raises what 1.7.4 does; the tests in
    `tests/python/test_launch_fastpath_key.py` count the key extractions and compare every result, key and kernel
    instance with the fast paths on and off, also for `None` after a dead weakly keyed argument.
-
-## Versions
-
-- `1.7.4+1`: changes 1 to 5.
-- `1.7.4+2`: change 6 added.
-- `1.7.4+3`: change 7 added.
-- `1.7.4+4`: changes 8 and 9 added.
 
 ## Wheels
 
